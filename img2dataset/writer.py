@@ -86,6 +86,22 @@ class ParquetSampleWriter:
                 sample["txt"] = None
         sample.update(meta)
         self.buffered_parquet_writer.write(sample)
+        
+    def write_multi_images(self, images_and_metas, key, caption):
+        """写入多个图像，仅保存第一个成功的图像"""
+        for img_str, meta in images_and_metas:
+            if img_str is not None:
+                # 找到第一个成功的图像，写入并返回
+                self.write(img_str, key, caption, meta)
+                return
+        
+        # 如果没有成功的图像，使用第一个元数据写入空记录
+        if images_and_metas:
+            self.write(None, key, caption, images_and_metas[0][1])
+        else:
+            # 如果完全没有图像，创建一个空记录
+            empty_meta = {"status": "failed_to_download", "error_message": "No images available"}
+            self.write(None, key, caption, empty_meta)
 
     def close(self):
         self.buffered_parquet_writer.close()
@@ -128,6 +144,47 @@ class WebDatasetSampleWriter:
             sample["json"] = json.dumps(meta, indent=4)
             self.tarwriter.write(sample)
         self.buffered_parquet_writer.write(meta)
+        
+    def write_multi_images(self, images_and_metas, key, caption):
+        """写入多个图像，对于 WebDataset，我们保存多个图像但序号不同"""
+        # 保存成功的图像计数
+        success_count = 0
+        
+        for idx, (img_str, meta) in enumerate(images_and_metas):
+            if img_str is not None:
+                # 为每个图像生成唯一键，使用序号后缀区分
+                img_key = f"{key}_{idx}"
+                sample = {"__key__": img_key, self.encode_format: img_str}
+                if self.save_caption:
+                    sample["txt"] = str(caption) if caption is not None else ""
+                # 处理元数据
+                meta_copy = meta.copy()
+                for k, v in meta_copy.items():
+                    if isinstance(v, np.ndarray):
+                        meta_copy[k] = v.tolist()
+                # 添加原始键的信息
+                meta_copy["original_key"] = key
+                meta_copy["image_index"] = idx
+                sample["json"] = json.dumps(meta_copy, indent=4)
+                self.tarwriter.write(sample)
+                success_count += 1
+            
+            # 记录所有图像的元数据到 Parquet
+            self.buffered_parquet_writer.write(meta)
+        
+        # 如果没有成功的图像，记录失败信息
+        if success_count == 0:
+            # 使用第一个元数据（如果有的话）
+            if images_and_metas:
+                self.buffered_parquet_writer.write(images_and_metas[0][1])
+            else:
+                # 创建基本的失败记录
+                empty_meta = {
+                    "key": key,
+                    "status": "failed_to_download",
+                    "error_message": "No images available"
+                }
+                self.buffered_parquet_writer.write(empty_meta)
 
     def close(self):
         self.buffered_parquet_writer.close()
@@ -196,6 +253,48 @@ class TFRecordSampleWriter:
             tf_example = self._Example(features=self._Features(feature=sample))
             self.tf_writer.write(tf_example.SerializeToString())
         self.buffered_parquet_writer.write(meta)
+        
+    def write_multi_images(self, images_and_metas, key, caption):
+        """写入多个图像，对于 TFRecord 格式，为每个图像创建单独的记录"""
+        success_count = 0
+        
+        for idx, (img_str, meta) in enumerate(images_and_metas):
+            if img_str is not None:
+                # 生成带有序号的唯一键
+                img_key = f"{key}_{idx}"
+                
+                # 创建 TFRecord 样本
+                sample = {
+                    "key": self._bytes_feature(img_key.encode()),
+                    self.encode_format: self._bytes_feature(img_str),
+                }
+                if self.save_caption:
+                    sample["txt"] = self._bytes_feature(str(caption) if caption is not None else "")
+                    
+                # 添加元数据
+                meta_copy = meta.copy()
+                meta_copy["original_key"] = key
+                meta_copy["image_index"] = idx
+                for k, v in meta_copy.items():
+                    sample[k] = self._feature(v)
+                    
+                # 写入 TFRecord
+                tf_example = self._Example(features=self._Features(feature=sample))
+                self.tf_writer.write(tf_example.SerializeToString())
+                success_count += 1
+                
+            # 同时将元数据写入到 Parquet
+            self.buffered_parquet_writer.write(meta)
+            
+        # 如果没有成功的图像，记录失败信息
+        if success_count == 0 and not images_and_metas:
+            # 创建基本的失败记录
+            empty_meta = {
+                "key": key,
+                "status": "failed_to_download",
+                "error_message": "No images available"
+            }
+            self.buffered_parquet_writer.write(empty_meta)
 
     def close(self):
         self.buffered_parquet_writer.close()
@@ -288,6 +387,57 @@ class FilesSampleWriter:
             with self.fs.open(meta_filename, "w") as f:
                 f.write(j)
         self.buffered_parquet_writer.write(meta)
+        
+    def write_multi_images(self, images_and_metas, key, caption):
+        """为每个图像写入单独的文件，文件名带有序号后缀"""
+        success_count = 0
+        
+        for idx, (img_str, meta) in enumerate(images_and_metas):
+            if img_str is not None:
+                # 为每个图像创建带有序号的键名
+                img_key = f"{key}_{idx}"
+                
+                # 写入图像文件
+                filename = f"{self.subfolder}/{img_key}.{self.encode_format}"
+                with self.fs.open(filename, "wb") as f:
+                    f.write(img_str)
+                
+                # 如果需要保存标题，为每个图像创建单独的标题文件
+                if self.save_caption:
+                    caption_text = str(caption) if caption is not None else ""
+                    caption_filename = f"{self.subfolder}/{img_key}.txt"
+                    with self.fs.open(caption_filename, "w") as f:
+                        f.write(caption_text)
+                
+                # 处理元数据
+                meta_copy = meta.copy()
+                for k, v in meta_copy.items():
+                    if isinstance(v, np.ndarray):
+                        meta_copy[k] = v.tolist()
+                
+                # 添加原始键和索引信息到元数据
+                meta_copy["original_key"] = key
+                meta_copy["image_index"] = idx
+                
+                # 写入元数据文件
+                meta_json = json.dumps(meta_copy, indent=4)
+                meta_filename = f"{self.subfolder}/{img_key}.json"
+                with self.fs.open(meta_filename, "w") as f:
+                    f.write(meta_json)
+                
+                success_count += 1
+            
+            # 所有元数据都保存到 Parquet 文件
+            self.buffered_parquet_writer.write(meta)
+        
+        # 如果没有成功的图像，记录失败信息
+        if success_count == 0 and not images_and_metas:
+            empty_meta = {
+                "key": key,
+                "status": "failed_to_download",
+                "error_message": "No images available"
+            }
+            self.buffered_parquet_writer.write(empty_meta)
 
     def close(self):
         self.buffered_parquet_writer.close()
@@ -300,6 +450,10 @@ class DummySampleWriter:
         pass
 
     def write(self, img_str, key, caption, meta):
+        pass
+        
+    def write_multi_images(self, images_and_metas, key, caption):
+        """虚拟写入多图像，实际上不执行任何操作"""
         pass
 
     def close(self):
